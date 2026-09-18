@@ -3,7 +3,7 @@ use crate::types::{MetadataRequest, MetadataType, QueryResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use mysql_async::prelude::Queryable;
-use mysql_async::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, Row, Value as MyValue};
+use mysql_async::{Opts, OptsBuilder, Pool, PoolConstraints, Row, Value as MyValue};
 use serde_json::{Map, Value};
 use url::Url;
 
@@ -148,9 +148,11 @@ fn build_opts(value: &str) -> Result<Opts> {
         return Ok(opts);
     }
     // Keep URL-derived PoolOpts (ttl / reset / etc.); only fill default max when pool_max is unset.
+    // Clamp min so it never exceeds the default max=4 (mysql_async defaults can be min>4).
     let constraints = opts.pool_opts().constraints();
+    let min = constraints.min().min(4);
     let pool_opts = opts.pool_opts().clone().with_constraints(
-        PoolConstraints::new(constraints.min(), 4).ok_or_else(|| {
+        PoolConstraints::new(min, 4).ok_or_else(|| {
             anyhow::anyhow!("invalid mysql pool constraints")
         })?,
     );
@@ -209,6 +211,23 @@ mod tests {
             opts.pool_opts().inactive_connection_ttl(),
             std::time::Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn default_pool_max_clamps_min_when_above_four() {
+        let opts = build_opts(
+            "mysql://user:pass@127.0.0.1:3306/db?pool_min=10",
+        )
+        .unwrap();
+        assert_eq!(opts.pool_opts().constraints().min(), 4);
+        assert_eq!(opts.pool_opts().constraints().max(), 4);
+    }
+
+    #[test]
+    fn default_pool_max_on_bare_url() {
+        let opts = build_opts("mysql://user:pass@127.0.0.1:3306/db").unwrap();
+        assert_eq!(opts.pool_opts().constraints().max(), 4);
+        assert!(opts.pool_opts().constraints().min() <= 4);
     }
 
     #[test]
