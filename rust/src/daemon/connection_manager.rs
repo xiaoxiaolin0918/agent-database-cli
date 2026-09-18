@@ -6,6 +6,7 @@ use crate::types::{AppConfig, DatabaseConfig, MetadataRequest, QueryResult};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
@@ -16,6 +17,22 @@ struct Entry {
     config: DatabaseConfig,
     tunnel: Option<StartedSshTunnel>,
     last_used: Instant,
+    in_flight: Arc<AtomicUsize>,
+}
+
+struct InFlightGuard(Arc<AtomicUsize>);
+
+impl InFlightGuard {
+    fn enter(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 enum EntrySlot {
@@ -38,20 +55,36 @@ impl ConnectionManager {
 
     pub async fn test(&self, name: &str) -> Result<Value> {
         let entry = self.get_entry(name).await?;
-        let mut entry = entry.lock().await;
         let timeout_secs = query_timeout_secs();
-        match timeout(Duration::from_secs(timeout_secs), entry.adapter.test()).await {
-            Ok(Ok(())) => {
-                entry.last_used = Instant::now();
-                Ok(json!({ "ok": true }))
+        let (shared, flights) = {
+            let guard = entry.lock().await;
+            (guard.adapter.shared_handle(), guard.in_flight.clone())
+        };
+        let _lease = InFlightGuard::enter(flights);
+        if let Some(shared) = shared {
+            match timeout(Duration::from_secs(timeout_secs), shared.test()).await {
+                Ok(Ok(())) => {
+                    touch_last_used(&entry).await;
+                    Ok(json!({ "ok": true }))
+                }
+                Ok(Err(error)) => Err(error),
+                Err(_) => {
+                    // Do not disconnect the whole MySQL pool on a single timed-out request.
+                    Err(timeout_error(timeout_secs))
+                }
             }
-            Ok(Err(error)) => Err(error),
-            Err(_) => {
-                let _ = entry.adapter.disconnect().await;
-                anyhow::bail!(
-                    "查询超时（>{}s）：客户端已停止等待；请检查 SQL / 索引，或用 EXPLAIN 评估。Oracle 原生驱动会同时设置 OCI call timeout",
-                    timeout_secs
-                );
+        } else {
+            let mut guard = entry.lock().await;
+            match timeout(Duration::from_secs(timeout_secs), guard.adapter.test()).await {
+                Ok(Ok(())) => {
+                    guard.last_used = Instant::now();
+                    Ok(json!({ "ok": true }))
+                }
+                Ok(Err(error)) => Err(error),
+                Err(_) => {
+                    let _ = guard.adapter.disconnect().await;
+                    Err(timeout_error(timeout_secs))
+                }
             }
         }
     }
@@ -60,50 +93,86 @@ impl ConnectionManager {
         let config = get_database_config(&self.config, name)?;
         assert_command_allowed(config, command)?;
         let entry = self.get_entry(name).await?;
-        let mut entry = entry.lock().await;
         let timeout_secs = query_timeout_secs();
-        match timeout(
-            Duration::from_secs(timeout_secs),
-            entry.adapter.execute(command),
-        )
-        .await
-        {
-            Ok(Ok(result)) => {
-                entry.last_used = Instant::now();
-                Ok(result)
+        let (shared, flights) = {
+            let guard = entry.lock().await;
+            (guard.adapter.shared_handle(), guard.in_flight.clone())
+        };
+        let _lease = InFlightGuard::enter(flights);
+        if let Some(shared) = shared {
+            match timeout(
+                Duration::from_secs(timeout_secs),
+                shared.execute(command),
+            )
+            .await
+            {
+                Ok(Ok(result)) => {
+                    touch_last_used(&entry).await;
+                    Ok(result)
+                }
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(timeout_error(timeout_secs)),
             }
-            Ok(Err(error)) => Err(error),
-            Err(_) => {
-                let _ = entry.adapter.disconnect().await;
-                anyhow::bail!(
-                    "查询超时（>{}s）：请检查 SQL 是否缺索引条件，或用 EXPLAIN 评估",
-                    timeout_secs
-                );
+        } else {
+            let mut guard = entry.lock().await;
+            match timeout(
+                Duration::from_secs(timeout_secs),
+                guard.adapter.execute(command),
+            )
+            .await
+            {
+                Ok(Ok(result)) => {
+                    guard.last_used = Instant::now();
+                    Ok(result)
+                }
+                Ok(Err(error)) => Err(error),
+                Err(_) => {
+                    let _ = guard.adapter.disconnect().await;
+                    Err(timeout_error(timeout_secs))
+                }
             }
         }
     }
 
     pub async fn metadata(&self, name: &str, request: MetadataRequest) -> Result<QueryResult> {
         let entry = self.get_entry(name).await?;
-        let mut entry = entry.lock().await;
         let timeout_secs = query_timeout_secs();
-        match timeout(
-            Duration::from_secs(timeout_secs),
-            entry.adapter.metadata(request),
-        )
-        .await
-        {
-            Ok(Ok(result)) => {
-                entry.last_used = Instant::now();
-                Ok(result)
+        let (shared, flights) = {
+            let guard = entry.lock().await;
+            (guard.adapter.shared_handle(), guard.in_flight.clone())
+        };
+        let _lease = InFlightGuard::enter(flights);
+        if let Some(shared) = shared {
+            match timeout(
+                Duration::from_secs(timeout_secs),
+                shared.metadata(request),
+            )
+            .await
+            {
+                Ok(Ok(result)) => {
+                    touch_last_used(&entry).await;
+                    Ok(result)
+                }
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(timeout_error(timeout_secs)),
             }
-            Ok(Err(error)) => Err(error),
-            Err(_) => {
-                let _ = entry.adapter.disconnect().await;
-                anyhow::bail!(
-                    "查询超时（>{}s）：请检查 SQL 是否缺索引条件，或用 EXPLAIN 评估",
-                    timeout_secs
-                );
+        } else {
+            let mut guard = entry.lock().await;
+            match timeout(
+                Duration::from_secs(timeout_secs),
+                guard.adapter.metadata(request),
+            )
+            .await
+            {
+                Ok(Ok(result)) => {
+                    guard.last_used = Instant::now();
+                    Ok(result)
+                }
+                Ok(Err(error)) => Err(error),
+                Err(_) => {
+                    let _ = guard.adapter.disconnect().await;
+                    Err(timeout_error(timeout_secs))
+                }
             }
         }
     }
@@ -153,11 +222,15 @@ impl ConnectionManager {
             let EntrySlot::Ready(entry) = slot else {
                 continue;
             };
-            let Ok(entry) = entry.try_lock() else {
+            let Ok(guard) = entry.try_lock() else {
+                // Non-shared adapters still hold the entry lock during queries.
                 continue;
             };
-            let keep_alive = Duration::from_secs(entry.config.keep_alive_seconds.unwrap_or(600));
-            if now.duration_since(entry.last_used) >= keep_alive {
+            if guard.in_flight.load(Ordering::SeqCst) > 0 {
+                continue;
+            }
+            let keep_alive = Duration::from_secs(guard.config.keep_alive_seconds.unwrap_or(600));
+            if now.duration_since(guard.last_used) >= keep_alive {
                 expired.push(name.clone());
             }
         }
@@ -179,19 +252,21 @@ impl ConnectionManager {
                 }));
                 continue;
             };
-            let Ok(entry) = entry.try_lock() else {
+            let Ok(guard) = entry.try_lock() else {
                 connections.push(json!({
                     "name": name,
                     "busy": true,
                 }));
                 continue;
             };
+            let busy = guard.in_flight.load(Ordering::SeqCst) > 0;
             connections.push(json!({
                 "name": name,
-                "type": format!("{:?}", entry.config.db_type).to_lowercase(),
-                "keepAliveSeconds": entry.config.keep_alive_seconds.unwrap_or(600),
-                "sshTunnel": entry.tunnel.is_some(),
-                "busy": false,
+                "type": format!("{:?}", guard.config.db_type).to_lowercase(),
+                "keepAliveSeconds": guard.config.keep_alive_seconds.unwrap_or(600),
+                "sshTunnel": guard.tunnel.is_some(),
+                "busy": busy,
+                "inFlight": guard.in_flight.load(Ordering::SeqCst),
             }));
         }
         json!({ "connections": connections })
@@ -252,6 +327,17 @@ impl ConnectionManager {
     }
 }
 
+async fn touch_last_used(entry: &Arc<Mutex<Entry>>) {
+    let mut guard = entry.lock().await;
+    guard.last_used = Instant::now();
+}
+
+fn timeout_error(timeout_secs: u64) -> anyhow::Error {
+    anyhow::anyhow!(
+        "查询超时（>{}s）：客户端已停止等待；请检查 SQL / 索引，或用 EXPLAIN 评估。Oracle 原生驱动会同时设置 OCI call timeout",
+        timeout_secs
+    )
+}
 
 fn query_timeout_secs() -> u64 {
     std::env::var("AGENT_DB_QUERY_TIMEOUT_SECS")
@@ -278,5 +364,6 @@ async fn create_entry(config: &AppConfig, name: &str) -> Result<Entry> {
         config,
         tunnel,
         last_used: Instant::now(),
+        in_flight: Arc::new(AtomicUsize::new(0)),
     })
 }
