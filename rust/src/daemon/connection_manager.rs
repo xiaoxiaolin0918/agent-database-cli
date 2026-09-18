@@ -49,7 +49,7 @@ impl ConnectionManager {
             Err(_) => {
                 let _ = entry.adapter.disconnect().await;
                 anyhow::bail!(
-                    "查询超时（>{}s）：请检查 SQL 是否缺索引条件，或用 EXPLAIN 评估",
+                    "查询超时（>{}s）：客户端已停止等待；请检查 SQL / 索引，或用 EXPLAIN 评估。Oracle 原生驱动会同时设置 OCI call timeout",
                     timeout_secs
                 );
             }
